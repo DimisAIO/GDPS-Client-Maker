@@ -1,8 +1,16 @@
 ﻿Imports System.IO
 Imports System.IO.Compression
 Imports System.Net
+Imports Org.BouncyCastle.Asn1.X509
+Imports Org.BouncyCastle.Crypto
+Imports Org.BouncyCastle.Crypto.Generators
+Imports Org.BouncyCastle.Math
+Imports Org.BouncyCastle.Pkcs
+Imports Org.BouncyCastle.Security
+Imports Org.BouncyCastle.X509
 Public Class Form1
     ' Top 10 Spaghetti Code
+    Dim Password As String = Nothing
     Private Sub PrintLog(Log As String)
         TextBox2.Text += Log + Environment.NewLine
     End Sub
@@ -35,33 +43,115 @@ Public Class Form1
         End If
     End Sub
 
+    Public Sub CreateApkKey(keystorePath As String, password As String, aliasName As String)
+
+        Me.Password = password
+        ' Generate RSA key pair
+        Dim keyGen As New RsaKeyPairGenerator()
+        keyGen.Init(New KeyGenerationParameters(New SecureRandom(), 2048))
+        Dim keyPair = keyGen.GenerateKeyPair()
+
+        ' Create certificate
+        Dim attrs = New X509Name("CN=Android,O=AppSigner,C=EU")
+        Dim certGen = New X509V3CertificateGenerator()
+        Dim serial = BigInteger.ProbablePrime(120, New Random())
+
+        certGen.SetSerialNumber(serial)
+        certGen.SetIssuerDN(attrs)
+        certGen.SetSubjectDN(attrs)
+        certGen.SetNotBefore(DateTime.UtcNow)
+        certGen.SetNotAfter(DateTime.UtcNow.AddYears(25))
+        certGen.SetSignatureAlgorithm("SHA256WITHRSA")
+        certGen.SetPublicKey(keyPair.Public)
+
+        Dim cert = certGen.Generate(keyPair.Private)
+
+        ' Store in PKCS12 keystore
+        Dim store = New Pkcs12Store()
+        store.SetKeyEntry(aliasName, New AsymmetricKeyEntry(keyPair.Private),
+                      New X509CertificateEntry() {New X509CertificateEntry(cert)})
+
+        Using fs As New FileStream(keystorePath, FileMode.Create, FileAccess.Write)
+            store.Save(fs, password.ToCharArray(), New SecureRandom())
+        End Using
+
+    End Sub
+
+    Private Sub ReplaceAllOccurrences(ByRef data As Byte(), find As Byte(), replace As Byte())
+
+        If replace.Length <> find.Length Then
+            Throw New Exception("String 1's length isn't equal to String 2's")
+        End If
+
+        Dim i As Integer = 0
+        While i <= data.Length - find.Length
+
+            Dim match As Boolean = True
+            For j As Integer = 0 To find.Length - 1
+                If data(i + j) <> find(j) Then
+                    match = False
+                    Exit For
+                End If
+            Next
+
+            If match Then
+                Array.Copy(replace, 0, data, i, replace.Length)
+                i += replace.Length   ' continue after replaced block
+            Else
+                i += 1
+            End If
+        End While
+
+    End Sub
+
     Private Sub ReplaceBinary(BinaryPath As String, PSUrl As String, BundleName As String, PSName As String, Optional NewBinaryPC As String = "")
-        Dim BinaryBytes As Byte() = File.ReadAllBytes(BinaryPath)
-        Dim Binary As String = System.Text.Encoding.Default.GetString(BinaryBytes)
-        ' Basic Replacing
-        Binary = Binary.Replace("http://www.boomlings.com/database", PSUrl)
-        Binary = Binary.Replace("https://www.boomlings.com/database", PSUrl + "/")
-        Binary = Binary.Replace(Convert.ToBase64String(System.Text.Encoding.Default.GetBytes("http://www.boomlings.com/database")), Convert.ToBase64String(System.Text.Encoding.Default.GetBytes(PSUrl)))
+
+        Dim data As Byte() = File.ReadAllBytes(BinaryPath)
+
+        ' Replace raw ASCII sequences
+        ReplaceAllOccurrences(data,
+        System.Text.Encoding.ASCII.GetBytes("http://www.boomlings.com/database"),
+        System.Text.Encoding.ASCII.GetBytes(PSUrl))
+
+        ReplaceAllOccurrences(data,
+        System.Text.Encoding.ASCII.GetBytes("https://www.boomlings.com/database"),
+        System.Text.Encoding.ASCII.GetBytes(PSUrl & "/"))
+
+        ' Replace Base64 sequences
+        ReplaceAllOccurrences(data,
+        System.Text.Encoding.ASCII.GetBytes(Convert.ToBase64String(System.Text.Encoding.ASCII.GetBytes("http://www.boomlings.com/database"))),
+        System.Text.Encoding.ASCII.GetBytes(Convert.ToBase64String(System.Text.Encoding.ASCII.GetBytes(PSUrl))))
+
+        ' Bundle / plist handling
         If Not String.IsNullOrEmpty(BundleName) Then
-            Dim BundleOriginalName = "com.robtopx.geometryjump"
+
+            Dim originalBundle As String = "com.robtopx.geometryjump"
+
             If BundleName.Length = 23 Then
-                ' iOS
-                BundleOriginalName = "com.robtop.geometryjump"
+                originalBundle = "com.robtop.geometryjump"
+
                 If BinaryPath.EndsWith(".plist") Then
-                    Binary = Binary.Replace("Geometry", $"{PSName}")
-                    ' I am Lazy :)
-                    Binary = Binary.Replace($"{PSName}Jump", "GeometryJump")
+                    ReplaceAllOccurrences(data,
+                    System.Text.Encoding.ASCII.GetBytes("Geometry"),
+                    System.Text.Encoding.ASCII.GetBytes(PSName))
+
+                    ReplaceAllOccurrences(data,
+                    System.Text.Encoding.ASCII.GetBytes(PSName & "Jump"),
+                    System.Text.Encoding.ASCII.GetBytes("GeometryJump"))
                 End If
             End If
-            Binary = Binary.Replace(BundleOriginalName, BundleName)
+
+            ReplaceAllOccurrences(data,
+            System.Text.Encoding.ASCII.GetBytes(originalBundle),
+            System.Text.Encoding.ASCII.GetBytes(BundleName))
         End If
-        BinaryBytes = System.Text.Encoding.Default.GetBytes(Binary)
-        If String.IsNullOrEmpty(NewBinaryPC) Then
-            File.WriteAllBytes(BinaryPath, BinaryBytes)
-        Else
-            File.WriteAllBytes(NewBinaryPC, BinaryBytes)
-        End If
+
+        ' Save
+        Dim outputPath As String = If(String.IsNullOrEmpty(NewBinaryPC), BinaryPath, NewBinaryPC)
+        File.WriteAllBytes(outputPath, data)
+
     End Sub
+
 
     Private Function StartAndWait(AppPath As String, Arguments As String)
         Dim P As New ProcessStartInfo
@@ -137,6 +227,9 @@ Public Class Form1
             Dim TargetBinaryPath = Path.Combine(Directory.GetParent(TextBox1.Text).ToString, TargetName & ".exe")
             ReplaceBinary(TextBox1.Text, TextBox3.Text, "", TargetName, TargetBinaryPath)
         ElseIf Platform(TextBox1.Text) = 3 Then
+            If Not File.Exists(Path.Combine(Environment.CurrentDirectory, "gdps.keystore")) Then
+                PrintLog("Please create a keyset from File -> Make APK Certificate!")
+            End If
             Dim JavaCheck = StartAndWait("where", "java")
             If JavaCheck <> 0 Then
                 PrintLog("Java is not detected! If it is, go to Environment Variables on windows search and edit the Path variable to include it!")
@@ -145,18 +238,9 @@ Public Class Form1
             Dim ApkTool = Path.Combine(Environment.CurrentDirectory, "apktool")
             PrintLog("Extracting APK")
             If Not Directory.Exists(ApkTool) Then
-                PrintLog("APKTool not present, downloading...")
-                ServicePointManager.SecurityProtocol = SecurityProtocolType.Tls Or SecurityProtocolType.Tls11 Or SecurityProtocolType.Tls12
-
-                Dim remoteUri As String = "https://files.141412.xyz/r/apktool.zip"
-                Dim fileName As String = "apktool.zip"
-
-                Using client As New WebClient()
-                    client.DownloadFile(remoteUri, fileName)
-                End Using
-
-                ZipFile.ExtractToDirectory(Path.Combine(Environment.CurrentDirectory, "apktool.zip"), Environment.CurrentDirectory)
-                File.Delete(Path.Combine(Environment.CurrentDirectory, "apktool.zip"))
+                PrintLog("APKTool not present, please copy the folder to the same place as the APK Maker!")
+                Process.Start("https://files.141412.xyz/r/apktool.zip")
+                Return
             End If
             StartAndWait("java", $"-jar apktool\apktool.jar d ""{TextBox1.Text}"" -o apkedit")
             ' Inshallah
@@ -175,7 +259,8 @@ Public Class Form1
             StartAndWait("java", $"-jar apktool\apktool.jar b apkedit -o build_temp.apk")
             StartAndWait("apktool\zipalign.exe", $"4 build_temp.apk ""{TargetName}.apk""")
             File.Delete(Path.Combine(Environment.CurrentDirectory, "build_temp.apk"))
-            StartAndWait("java", $"-jar apktool\apksigner.jar sign --ks apktool\demo.jks --ks-pass pass:123456 ""{TargetName}.apk""")
+            If Password Is Nothing Then Password = InputBox("Enter Key Password: ")
+            StartAndWait("java", $"-jar apktool\apksigner.jar sign --ks gdps.keystore --ks-pass pass:{Password} ""{TargetName}.apk""")
             Directory.Delete(Path.Combine(Environment.CurrentDirectory, "apkedit"), True)
         Else
             PrintLog("No platform detected")
@@ -189,5 +274,28 @@ Public Class Form1
         PrintLog("Discord: https://dimisaio.be/discord")
         PrintLog("Note: Edited APKs/IPAs will be saved to the same folder as this program!")
         PrintLog("Note 2: Do not click on the program while doing its work! It will freeze and crash!")
+    End Sub
+
+    Private Sub MakeAPKCertificateToolStripMenuItem_Click(sender As Object, e As EventArgs) Handles MakeAPKCertificateToolStripMenuItem.Click
+        Dim User As String = InputBox("Username: ")
+        Dim Pass As String = InputBox("Password: ")
+        If Not String.IsNullOrEmpty(User) AndAlso Not String.IsNullOrEmpty(Pass) Then
+            CreateApkKey("gdps.keystore", "mypassword", "myalias")
+            If File.Exists(Path.Combine(Environment.CurrentDirectory, "gdps.keystore")) Then
+                PrintLog("Key Generated!")
+            Else
+                PrintLog("Failed to create key!")
+            End If
+        Else
+            PrintLog("Invalid values detected!")
+        End If
+    End Sub
+
+    Private Sub AboutToolStripMenuItem_Click(sender As Object, e As EventArgs) Handles AboutToolStripMenuItem.Click
+        MsgBox("ultimate gdps client maker, free open source. i hope it works lol")
+    End Sub
+
+    Private Sub ExitToolStripMenuItem_Click(sender As Object, e As EventArgs) Handles ExitToolStripMenuItem.Click
+        Close()
     End Sub
 End Class
